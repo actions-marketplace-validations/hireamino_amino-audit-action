@@ -1,0 +1,36 @@
+name: "Amino Email Deliverability Audit"
+description: "Catch SPF/DMARC/DKIM/MTA-STS regressions in CI. Audits your sending domain's email-auth posture. Read-only, no secrets."
+author: "Amino (hireamino.com)"
+
+branding:
+  icon: "shield"
+  color: "orange"
+
+inputs:
+  domains:
+    description: "One or more sending domains to audit (comma / space / newline separated). e.g. 'example.com, mail.example.com'."
+    required: true
+  fail-on:
+    description: "Fail the build if any finding is at-or-worse-than this severity. One of: advisory | low | medium | high | critical. Default 'advisory' never fails the build (report-only)."
+    required: false
+    default: "advisory"
+  comment-on-pr:
+    description: "If 'true' and the event is a pull_request, post the audit summary as a PR comment (requires github-token). Fails soft."
+    required: false
+    default: "false"
+  github-token:
+    description: "Token used only to post the PR comment. Defaults to the workflow token."
+    required: false
+    default: "${{ github.token }}"
+
+outputs:
+  passed:
+    description: "'true' if the audit passed the fail-on threshold, else 'false'."
+  worst-severity:
+    description: "The worst severity found across all domains (critical|high|medium|low), or 'none'."
+  summary:
+    description: "Compact JSON array of per-domain severity counts."
+
+runs:
+  using: "node20"
+  main: "src/index.mjs"

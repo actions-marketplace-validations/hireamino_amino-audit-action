@@ -1,0 +1,30 @@
+name: Dogfood
+
+# Proves the action works end-to-end on a real runner: audit hireamino.com in
+# advisory mode (never fails the build) on every push and PR.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run the audit on ourselves
+        id: audit
+        uses: ./
+        with:
+          domains: hireamino.com
+          fail-on: advisory
+
+      - name: Show outputs
+        run: |
+          echo "passed=${{ steps.audit.outputs.passed }}"
+          echo "worst-severity=${{ steps.audit.outputs.worst-severity }}"
+          echo "summary=${{ steps.audit.outputs.summary }}"
