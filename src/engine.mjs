@@ -108,6 +108,7 @@ async function mapPool(items, limit, fn) {
 
 function makeResolver() {
   const cache = new Map();
+  const metaCache = new Map(); // "type name" -> { status, ad, error }
   async function raw(name, rrtype) {
     const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${rrtype}`;
     let json;
@@ -116,11 +117,15 @@ function makeResolver() {
         headers: { accept: "application/dns-json" },
         signal: AbortSignal.timeout(5000),
       });
-      if (!res.ok) return [];
+      if (!res.ok) { metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true }); return []; }
       json = await res.json();
     } catch (e) {
+      metaCache.set(rrtype + " " + name, { status: null, ad: false, error: true });
       return [];
     }
+    // Surface DoH Status (RCODE: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, 5 REFUSED) and the AD
+    // (Authenticated Data = DNSSEC-validated) bit for the DNSSEC/DANE/reliability checks.
+    metaCache.set(rrtype + " " + name, { status: json.Status ?? null, ad: !!json.AD, error: false });
     const want = RR[rrtype];
     const rows = (json.Answer || []).filter((a) => a.type === want).map((a) => a.data);
     if (rrtype === "TXT") {
@@ -137,6 +142,11 @@ function makeResolver() {
     if (!cache.has(k)) cache.set(k, raw(name, rrtype));
     return cache.get(k);
   }
+  // DNSSEC/rcode meta for a lookup: { status, ad, error }. Ensures the lookup ran first.
+  query.meta = async (name, rrtype) => {
+    await query(name, rrtype);
+    return metaCache.get(rrtype + " " + name) || { status: null, ad: false, error: true };
+  };
   return query;
 }
 
@@ -150,9 +160,28 @@ async function firstTxt(name, prefix, q) {
   return null;
 }
 
+// A pragmatic subset of the Public Suffix List: registry suffixes where the
+// registrable domain is the last THREE labels, not two. Not exhaustive (the full PSL
+// is a ~200 KB data dependency); it fixes the cases that matter for same-org checks —
+// e.g. good.co.uk and evil.co.uk must read as DIFFERENT orgs, not both "co.uk".
+const PUBLIC_SUFFIX_2 = new Set([
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp",
+  "co.za", "org.za", "gov.za", "ac.za",
+  "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in",
+  "com.br", "net.br", "org.br", "gov.br",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "ac.cn",
+  "co.kr", "or.kr", "com.mx", "com.sg", "com.hk", "com.tw",
+  "co.il", "com.tr", "co.id", "com.my", "co.th", "or.th",
+]);
+
 function orgBase(host) {
-  const labels = host.replace(/\.+$/, "").toLowerCase().split(".");
-  return labels.length >= 2 ? labels.slice(-2).join(".") : host.replace(/\.+$/, "").toLowerCase();
+  const labels = host.replace(/\.+$/, "").toLowerCase().split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  return (PUBLIC_SUFFIX_2.has(lastTwo) ? labels.slice(-3) : labels.slice(-2)).join(".");
 }
 
 async function isVoid(name, q) {
@@ -232,7 +261,12 @@ function mxPatternMatches(pattern, host) {
   pattern = pattern.trim().replace(/\.+$/, "").toLowerCase();
   host = host.replace(/\.+$/, "").toLowerCase();
   if (pattern.startsWith("*.")) {
-    return host.endsWith(pattern.slice(1)) && (host.split(".").length - 1) >= (pattern.split(".").length - 1);
+    // RFC 8461 §4.1: a wildcard matches exactly ONE leftmost label — *.example.com
+    // matches mx.example.com but NOT a.b.example.com or example.com itself.
+    const suffix = pattern.slice(1); // ".example.com"
+    if (!host.endsWith(suffix)) return false;
+    const left = host.slice(0, host.length - suffix.length);
+    return left.length > 0 && !left.includes(".");
   }
   return pattern === host;
 }
@@ -255,7 +289,7 @@ async function mxProviders(domain, q) {
 // ── SPF ──────────────────────────────────────────────────────────────────────
 
 function spfQualifier(spf) {
-  const m = spf.match(/([-~?+]?)all\b/);
+  const m = spf.match(/([-~?+]?)all\b/i); // qualifiers are case-insensitive: -ALL == -all
   return !m ? null : (m[1] || "+");
 }
 
@@ -351,19 +385,53 @@ async function checkSpf(domain, F, q) {
 
 // ── DKIM ─────────────────────────────────────────────────────────────────────
 
+function b64ByteLen(s) {
+  try { return atob(s.replace(/\s+/g, "")).length; } catch { return -1; }
+}
+
+// Real RSA modulus bit-length from a DKIM p= (base64 SubjectPublicKeyInfo DER), or null
+// if it can't be parsed — more accurate than estimating from the base64 length. Pure
+// atob + manual DER walk so it works on Node AND the Cloudflare Workers runtime.
+function rsaModulusBits(b64) {
+  let bytes;
+  try { bytes = Uint8Array.from(atob(b64.replace(/\s+/g, "")), (c) => c.charCodeAt(0)); }
+  catch { return null; }
+  let i = 0;
+  const readLen = () => {
+    let n = bytes[i++];
+    if (n & 0x80) { let k = n & 0x7f; n = 0; while (k-- > 0) n = (n << 8) | bytes[i++]; }
+    return n;
+  };
+  const expect = (tag) => { if (bytes[i++] !== tag) throw new Error("der"); return readLen(); };
+  try {
+    expect(0x30);                              // SubjectPublicKeyInfo SEQUENCE
+    const algLen = expect(0x30); i += algLen;  // skip AlgorithmIdentifier
+    expect(0x03); i += 1;                       // BIT STRING, skip the unused-bits byte
+    expect(0x30);                              // RSAPublicKey SEQUENCE
+    let len = expect(0x02);                     // modulus INTEGER
+    if (bytes[i] === 0x00) len -= 1;            // strip a leading sign byte
+    return len > 0 ? len * 8 : null;
+  } catch { return null; }
+}
+
 function parseDkim(rec) {
   const kv = {};
-  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1]] = m[2];
+  for (const m of rec.matchAll(/(\w+)=([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
   const ktype = (kv.k || "rsa").trim().toLowerCase();
   const pub = (kv.p || "").trim();
   const flags = (kv.t || "").trim().toLowerCase();
   const testing = flags ? flags.split(":").map((x) => x.trim()).includes("y") : false;
-  let bits = null;
-  if (ktype === "rsa" && pub) {
-    const approx = Math.floor((pub.length * 3) / 4);
-    bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096;
+  // An empty p= is a REVOKED selector (RFC 6376 §3.6.1) — never a healthy key.
+  if (pub === "") return { ktype, pub, bits: null, testing, valid: false, reason: "revoked" };
+  let bits = null, valid = true, reason = null;
+  if (ktype === "rsa") {
+    bits = rsaModulusBits(pub); // real modulus …
+    if (bits === null) { const approx = Math.floor((pub.length * 3) / 4); bits = approx < 200 ? 1024 : approx < 400 ? 2048 : 4096; } // … or estimate if unparseable
+  } else if (ktype === "ed25519") {
+    // Ed25519 public keys are exactly 32 bytes; anything else is malformed.
+    if (b64ByteLen(pub) !== 32) { valid = false; reason = "malformed-ed25519"; }
   }
-  return { ktype, pub, bits, testing };
+  return { ktype, pub, bits, testing, valid, reason };
 }
 
 async function dkimCandidates(domain, q) {
@@ -386,16 +454,26 @@ async function dkimProbe(domain, sel, q) {
 async function dkimLookup(domain, q) {
   const cands = await dkimCandidates(domain, q);
   const recs = await mapPool(cands, MAX_DKIM_CONCURRENCY, (s) => dkimProbe(domain, s, q));
-  let weak = null, weakTesting = false;
+  let weak = null, weakTesting = false, invalid = null;
   for (let i = 0; i < cands.length; i++) {
     const rec = recs[i];
     if (!rec) continue;
-    const { ktype, bits, testing } = parseDkim(rec);
-    if (ktype === "rsa" && bits === 1024) { weak = weak || ("DKIM " + cands[i] + "=RSA-1024"); weakTesting = weakTesting || testing; continue; }
+    const { ktype, bits, testing, valid, reason } = parseDkim(rec);
+    if (valid === false) {
+      // Revoked/malformed key here. A healthy sibling selector still wins, so record
+      // it and keep scanning; surface it only if nothing better turns up.
+      invalid = invalid || (reason === "revoked"
+        ? "DKIM " + cands[i] + " revoked (empty p=)"
+        : "DKIM " + cands[i] + " malformed (" + reason + ")");
+      continue;
+    }
+    if (ktype === "rsa" && bits && bits < 2048) { weak = weak || ("DKIM " + cands[i] + "=RSA-" + bits); weakTesting = weakTesting || testing; continue; }
     const label = ktype.toUpperCase() + (bits ? "-" + bits : "");
     return ["good", "DKIM " + cands[i] + " (" + label + ")", testing];
   }
-  return weak ? ["weak", weak, weakTesting] : ["unknown", "no DKIM key at common/provider selectors", false];
+  if (weak) return ["weak", weak, weakTesting];
+  if (invalid) return ["invalid", invalid, false];
+  return ["unknown", "no DKIM key at common/provider selectors", false];
 }
 
 async function checkDkim(domain, F, q) {
@@ -407,6 +485,10 @@ async function checkDkim(domain, F, q) {
     F.push({ area: "DKIM", severity: "high", title: "DKIM key is RSA-1024 (legacy)",
       detail: "RSA-1024 is below current strength guidance and is being phased out; some receivers discount it, and it's the first thing a PQC/crypto-hygiene review flags.",
       fix: "Rotate the selector to RSA-2048 (or Ed25519): publish the new key, let it propagate, then switch signing over.", record: note });
+  } else if (state === "invalid") {
+    F.push({ area: "DKIM", severity: "high", title: "DKIM key is revoked or malformed",
+      detail: "A DKIM record is published but the key is unusable (" + note + "). A revoked (empty p=) or malformed key can't verify signatures — receivers treat the mail as unsigned, so DKIM gives no protection.",
+      fix: "Publish a valid key at this selector (RSA >=2048 or Ed25519), or remove the dead record and sign from a live selector.", record: note });
   } else {
     F.push({ area: "DKIM", severity: "low", title: "DKIM not found at common/provider selectors",
       detail: "No DKIM key at the selectors probed. DKIM has no discovery mechanism, so this is a blind spot — the domain may well sign with a custom selector. Verify against actual message headers before concluding DKIM is absent; don't treat this as a confirmed gap.",
@@ -421,29 +503,71 @@ async function checkDkim(domain, F, q) {
 
 // ── DMARC ────────────────────────────────────────────────────────────────────
 
+// RFC 9989 (DMARCbis) tree walk: the applicable DMARC record is the domain's own
+// _dmarc if present, otherwise the nearest ancestor's, walking up to the organizational
+// domain (bounded to 5 lookups). A subdomain with no record of its own inherits the
+// ancestor's sp (subdomain policy) if set, else its p.
+async function discoverDmarc(domain, q) {
+  domain = domain.replace(/\.+$/, "").toLowerCase();
+  const own = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  if (own) return { rec: own, source: domain, inherited: false };
+  const base = orgBase(domain);
+  const labels = domain.split(".");
+  for (let i = 1; i <= labels.length - 2 && i <= 5; i++) {
+    const parent = labels.slice(i).join(".");
+    const rec = await firstTxt("_dmarc." + parent, "v=dmarc1", q);
+    if (rec) return { rec, source: parent, inherited: true };
+    if (parent === base) break; // don't walk above the organizational domain
+  }
+  return { rec: null, source: null, inherited: false };
+}
+
 async function checkDmarc(domain, F, q) {
-  const rec = await firstTxt("_dmarc." + domain, "v=dmarc1", q);
+  const disc = await discoverDmarc(domain, q);
+  const rec = disc.rec;
   if (!rec) {
     F.push({ area: "DMARC", severity: "critical", title: "No DMARC record",
       detail: "No policy at _dmarc. Receivers have no instruction on how to handle unauthenticated mail in your name — and as of 2024-25, Gmail/Yahoo/Microsoft require DMARC for bulk senders. This is both a spoofing exposure and a hard deliverability blocker.",
-      fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports, then ramp to p=quarantine and p=reject.' });
+      fix: 'Publish TXT at _dmarc: start with "v=DMARC1; p=none; rua=mailto:dmarc@<domain>" to collect reports. Review those reports before any enforcement, then stage p=quarantine; whether p=reject is appropriate depends on your mail flows (RFC 9989 §7.4).' });
     return;
   }
-  const dmarcRecords = (await q("_dmarc." + domain, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
+  const kv = {};
+  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1].toLowerCase()] = m[2];
+  const p = (kv.p || "").trim().toLowerCase();
+  const sp = (kv.sp || "").trim().toLowerCase();
+  const VALID_POLICY = new Set(["none", "quarantine", "reject"]);
+
+  if (disc.inherited) {
+    // No _dmarc at this subdomain: it inherits the org domain's policy — the sp
+    // (subdomain policy) tag if set, otherwise p (RFC 9989 tree walk).
+    const eff = sp || p;
+    const src = disc.source;
+    if (!VALID_POLICY.has(eff) || eff === "none") {
+      F.push({ area: "DMARC", severity: "high", title: "DMARC subdomain not enforced (inherited " + (sp ? "sp" : "p") + "=" + (eff || "<missing>") + " from " + src + ")",
+        detail: "This subdomain has no _dmarc record; it inherits " + src + "'s policy, which resolves to " + (eff || "<missing>") + " — spoofed mail from this subdomain isn't stopped.",
+        fix: "Publish _dmarc." + domain + " with p=reject, or set sp=reject on " + src + "." });
+    } else {
+      F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (inherited " + (sp ? "sp" : "p") + "=" + eff + " from " + src + ")",
+        detail: "This subdomain has no record of its own and is covered by " + src + "'s enforced policy.", fix: null, record: rec });
+    }
+    return;
+  }
+
+  const dmarcRecords = (await q("_dmarc." + disc.source, "TXT")).filter((r) => r.toLowerCase().startsWith("v=dmarc1"));
   if (dmarcRecords.length > 1) {
     F.push({ area: "DMARC", severity: "high", title: "Multiple DMARC records (invalid)",
       detail: dmarcRecords.length + " DMARC records exist at _dmarc. Exactly one is allowed — receivers ignore the policy entirely when there are several, so you effectively have no DMARC.",
       fix: "Keep one DMARC record and remove the rest." });
   }
-  const kv = {};
-  for (const m of rec.matchAll(/(\w+)=\s*([^;]+)/g)) kv[m[1]] = m[2];
-  const p = (kv.p || "none").trim().toLowerCase();
-  const sp = (kv.sp || "").trim().toLowerCase();
   const rua = "rua" in kv;
-  if (p === "none") {
+  if (!VALID_POLICY.has(p)) {
+    F.push({ area: "DMARC", severity: "high", title: "DMARC policy value is invalid (p=" + (p || "<missing>") + ")",
+      detail: "The p= tag must be exactly none, quarantine, or reject (RFC 9989). An unrecognized or missing value means receivers apply no enforcement — you have a DMARC record but no effective policy.",
+      fix: "Set p= to none (monitor), quarantine, or reject." });
+  } else if (p === "none") {
     F.push({ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
-      detail: "p=none means spoofed mail is still delivered. It's a valid starting point but offers no protection at rest; mailbox providers increasingly treat enforced policies as a trust signal.",
-      fix: "After reviewing aggregate reports, ramp to p=quarantine then p=reject (optionally with pct= staging)." });
+      detail: "p=none offers, in the words of RFC 9989, no expression of preference — a receiver applying DMARC has nothing to act on, though its own filtering still applies. An enforcement policy requests quarantine or rejection of failures, but it can affect legitimate mail when an authorized sender is unauthenticated or misaligned, which is why aggregate reports come first. This is primarily an anti-spoofing gap, not a deliverability failure.",
+      fix: "Collect and review DMARC aggregate reports before enforcement, and remediate every legitimate unauthenticated or misaligned stream. Move to p=quarantine once authorized sources are passing. Before considering p=reject, ensure every legitimate stream has valid, DMARC-aligned DKIM rather than relying only on SPF. RFC 9989 §7.4 advises domains whose users may post to mailing lists not to publish p=reject; for those that still do, it recommends at least a month at p=none followed by an equally long period at p=quarantine. Treat reject as conditional on your mail flows, not as the default destination. RFC 9989 removed pct; use t=y to test an enforcement policy instead." });
   } else {
     F.push({ area: "DMARC", severity: "pass", title: "DMARC enforced (p=" + p + ")",
       detail: "Enforcement policy in place.", fix: null, record: rec });
@@ -497,43 +621,66 @@ async function fetchMtaStsPolicy(domain, env, q) {
     const res = await fetch("https://mta-sts." + domain + "/.well-known/mta-sts.txt", {
       signal: AbortSignal.timeout(3000), redirect: "manual",
     });
-    if (!res.ok) return null;
+    // RFC 8461 §3.3: the policy MUST be served as HTTP 200 with Content-Type text/plain.
+    if (res.status !== 200) return null;
+    if (!(res.headers.get("content-type") || "").toLowerCase().includes("text/plain")) return null;
     return (await res.text()).slice(0, 8192);
   } catch (e) {
     return null;
   }
 }
 
+// RFC 8461 §3.2 policy validation. Returns { problems[], mode, maxAge, polMx }.
+// A well-formed policy has version: STSv1, a valid mode, an integer max_age in range,
+// and (unless mode: none) at least one mx:. Exported for conformance tests.
+export function mtaStsPolicyProblems(policy) {
+  const version = (policy.match(/^[ \t]*version:[ \t]*(\S+)/im) || [])[1];
+  const mode = ((policy.match(/^[ \t]*mode:[ \t]*(\w+)/im) || [])[1] || "").toLowerCase();
+  const maxAgeRaw = (policy.match(/^[ \t]*max_age:[ \t]*(\d+)/im) || [])[1];
+  const maxAge = maxAgeRaw === undefined ? null : parseInt(maxAgeRaw, 10);
+  const polMx = [...policy.matchAll(/^[ \t]*mx:[ \t]*(\S+)/gim)].map((m) => m[1]);
+  const problems = [];
+  if (!version || version.toLowerCase() !== "stsv1") problems.push("missing/invalid version (must be STSv1)");
+  if (!["enforce", "testing", "none"].includes(mode)) problems.push("missing/invalid mode");
+  if (maxAge === null || maxAge <= 0 || maxAge > 31557600) problems.push("missing/invalid max_age");
+  if (mode !== "none" && polMx.length === 0) problems.push("no mx entries");
+  return { problems, mode, maxAge, polMx };
+}
+
 async function checkMtaSts(domain, F, q) {
   const txt = await firstTxt("_mta-sts." + domain, "v=stsv1", q);
-  const policy = await fetchMtaStsPolicy(domain, null, q);
   if (!txt) {
     F.push({ area: "MTA-STS", severity: "medium", title: "No MTA-STS policy",
-      detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and a growing compliance ask under NIS2/gov mandates). Absent it, downgrade attacks on mail-in-transit are possible.",
-      fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt with mode: enforce." });
+      detail: "MTA-STS lets you require TLS for inbound SMTP and is part of a modern transport posture (and increasingly asked for in EU procurement, and specified in BSI's guidance for secure email transport (TR-03108)). Absent it, downgrade attacks on mail-in-transit are possible.",
+      fix: "Publish _mta-sts TXT (v=STSv1; id=...) and host https://mta-sts.<domain>/.well-known/mta-sts.txt. Stage it: publish TLS-RPT first so you get failure reports, start at mode: testing, confirm every production AND backup MX passes TLS, then switch to mode: enforce (RFC 8461 provides testing mode for exactly this)." });
     return;
   }
-  const mm = (policy || "").match(/mode:\s*(\w+)/);
-  const mode = mm ? mm[1].toLowerCase() : "unknown";
+  const policy = await fetchMtaStsPolicy(domain, null, q);
+  if (!policy) {
+    F.push({ area: "MTA-STS", severity: "medium", title: "MTA-STS TXT present but policy file not retrievable",
+      detail: "The _mta-sts TXT record advertises a policy, but https://mta-sts." + domain + "/.well-known/mta-sts.txt did not return a valid policy (RFC 8461 requires HTTP 200 with Content-Type text/plain). Senders can't fetch it, so MTA-STS isn't actually enforced.",
+      fix: "Serve the policy at that URL over HTTPS with status 200 and Content-Type: text/plain." });
+    return;
+  }
+  const { problems, mode, polMx } = mtaStsPolicyProblems(policy);
+  if (problems.length) {
+    F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy is malformed",
+      detail: "The hosted policy is invalid (" + problems.join("; ") + "). RFC 8461 requires version: STSv1, a valid mode, an integer max_age, and at least one mx: (unless mode: none)." +
+        (mode === "enforce" ? " Under mode: enforce a malformed policy can break inbound mail delivery." : ""),
+      fix: "Fix the hosted mta-sts.txt to include version: STSv1, mode:, max_age:, and mx: lines per RFC 8461." });
+    return;
+  }
   F.push({ area: "MTA-STS", severity: mode === "enforce" ? "pass" : "medium", title: "MTA-STS present (mode: " + mode + ")",
     detail: "Policy published." + (mode === "enforce" ? "" : " mode is not 'enforce' — testing/none gives no real protection."),
     fix: mode === "enforce" ? null : "Move policy to mode: enforce once tested." });
-  if (policy) {
-    if (!/max_age:\s*(\d+)/.test(policy)) {
-      F.push({ area: "MTA-STS", severity: "low", title: "MTA-STS policy missing max_age",
-        detail: "The hosted policy has no max_age, so caching behavior is undefined and the policy may not 'stick' at senders.",
-        fix: "Add a max_age (e.g. max_age: 604800) to the hosted mta-sts.txt." });
-    }
-    const polMx = [...policy.matchAll(/mx:\s*(\S+)/g)].map((m) => m[1]);
-    const realMx = mxHosts(await q(domain, "MX"));
-    if (polMx.length && realMx.length) {
-      const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
-      if (unmatched.length) {
-        F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
-          detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
-            (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
-          fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
-      }
+  const realMx = mxHosts(await q(domain, "MX"));
+  if (polMx.length && realMx.length) {
+    const unmatched = realMx.filter((h) => !polMx.some((p) => mxPatternMatches(p, h)));
+    if (unmatched.length) {
+      F.push({ area: "MTA-STS", severity: mode === "enforce" ? "high" : "medium", title: "MTA-STS policy does not cover all MX hosts",
+        detail: "These live MX hosts match no mx: line in the policy: " + unmatched.join(", ") + "." +
+          (mode === "enforce" ? " Under mode: enforce, senders will REFUSE to deliver to them — active mail loss." : " Once you move to enforce, mail to them will fail."),
+        fix: "Add the missing MX hostnames (or a *.<domain> wildcard) to the mx: lines in the hosted policy." });
     }
   }
 }
@@ -602,19 +749,27 @@ async function checkTransport(domain, F, q) {
     const pa = a.split(/\s+/)[0], pb = b.split(/\s+/)[0];
     return (/^\d+$/.test(pa) ? +pa : 99) - (/^\d+$/.test(pb) ? +pb : 99);
   })[0].split(/\s+/).pop().replace(/\.+$/, "");
-  const dane = await q("_25._tcp." + host, "TLSA");
+  const daneName = "_25._tcp." + host;
+  const dane = await q(daneName, "TLSA");
+  const daneMeta = q.meta ? await q.meta(daneName, "TLSA") : null;
   if (dane.length) {
     const bad = badTlsa(dane);
     if (bad) {
       F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but misconfigured",
         detail: "TLSA records exist but " + bad + " For SMTP DANE only usage 3 (DANE-EE) or 2 (DANE-TA) are valid, and matching-type 1 (SHA-256) is recommended; an invalid record can break DANE-enforcing senders.",
         fix: "Correct the TLSA usage/selector/matching-type (typically '3 1 1' for the MX cert) and re-publish." });
+    } else if (daneMeta && daneMeta.ad === false) {
+      // TLSA present but the answer isn't DNSSEC-authenticated — DANE REQUIRES a validated
+      // chain (RFC 7672), so an unsigned TLSA is not active protection.
+      F.push({ area: "Transport", severity: "medium", title: "DANE/TLSA present but not DNSSEC-validated",
+        detail: "TLSA records exist but the response isn't DNSSEC-authenticated (AD bit not set). DANE requires a validated DNSSEC chain — without it senders can't trust the TLSA, so DANE gives no protection and can't be enforced.",
+        fix: "Enable DNSSEC on the zone so the TLSA records are cryptographically validated." });
     } else {
-      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert (requires DNSSEC).", fix: null });
+      F.push({ area: "Transport", severity: "pass", title: "DANE/TLSA present", detail: "TLSA records bind the MX cert" + (daneMeta && daneMeta.ad ? " (DNSSEC-validated)." : "."), fix: null });
     }
   } else {
     F.push({ area: "Transport", severity: "low", title: "No DANE/TLSA",
-      detail: "No TLSA records on the MX. DANE is an emerging transport-security ask (NIS2/BSI) and depends on DNSSEC.",
+      detail: "No TLSA records on the MX. DANE is recommended in BSI guidance for secure email transport (TR-03108) and depends on DNSSEC.",
       fix: "If DNSSEC is enabled, publish TLSA records for the MX; otherwise enable DNSSEC first." });
   }
   return host;
@@ -642,12 +797,18 @@ async function checkMxHygiene(domain, F, q) {
 
 async function checkDnssec(domain, F, q) {
   const keys = await q(domain, "DNSKEY");
-  if (keys.length) {
+  const meta = q.meta ? await q.meta(domain, "DNSKEY") : null;
+  // The AD (Authenticated Data) bit from a validating resolver is authoritative and
+  // respects the zone cut — a validated NODATA inside a signed parent still sets AD, so
+  // a subdomain isn't mis-reported as unsigned. Fall back to DNSKEY presence only when
+  // meta isn't available (non-DoH resolver / mock).
+  const signed = meta ? meta.ad : keys.length > 0;
+  if (signed) {
     F.push({ area: "DNSSEC", severity: "pass", title: "DNSSEC enabled",
-      detail: "The zone is DNSSEC-signed.", fix: null });
+      detail: "The zone is DNSSEC-signed and answers validate.", fix: null });
   } else {
     F.push({ area: "DNSSEC", severity: "low", title: "DNSSEC not enabled",
-      detail: "The zone publishes no DNSKEY, so DNS answers for this domain aren't cryptographically signed — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
+      detail: "DNS answers for this domain aren't cryptographically signed/validated — and DANE can't be used without it. A trust/security gap more than a deliverability one.",
       fix: "Enable DNSSEC at your DNS provider (it's also the prerequisite for DANE)." });
   }
 }
@@ -839,12 +1000,12 @@ function action(f) {
   if (a === "DMARC") {
     if (t.includes("no dmarc")) return "Publish a DMARC policy";
     if (t.includes("multiple dmarc")) return "Merge to a single DMARC record";
-    if (t.includes("p=none (monitor")) return "Ramp DMARC up to p=reject";
+    if (t.includes("p=none (monitor")) return "Review DMARC reports, then stage quarantine";
     if (t.includes("subdomain policy")) return "Set DMARC sp=reject for subdomains";
     if (t.includes("partially enforced")) return "Raise DMARC pct to 100";
     if (t.includes("removed in rfc 9989")) return "Modernize DMARC tags for RFC 9989";
     if (t.includes("report destination")) return "Authorize the external DMARC report destination";
-    if (t.includes("rua")) return "Turn on DMARC reporting (rua)";
+    if (t.includes("rua")) return "Turn on DMARC reporting (rua) — needed before you enforce";
     return "Strengthen the DMARC policy";
   }
   if (a === "MTA-STS") {
@@ -893,7 +1054,23 @@ export async function auditDomain(domain, q) {
     checkReverseDns(domain, rdns, q),
     checkCaa(domain, caa, q),
   ]);
-  const F = [...spf, ...dkim, ...dmarc, ...mta, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa];
+  // INBOUND-ONLY controls are not applicable to a domain that receives no mail. MTA-STS
+  // (RFC 8461) protects mail being delivered TO a domain, and a null MX (RFC 7505) or no
+  // MX at all says explicitly that none is. Recommending inbound TLS protection for mail
+  // that by definition never arrives is noise dressed as a finding — and it competed with
+  // real sending problems in the priority ranking. These checks run in parallel, so the MX
+  // verdict isn't known until they've all settled; filter here rather than serialise them.
+  const noInboundMail = transport.some((f) => /Null MX|No inbound mail servers/i.test(f.title || ""));
+  // TLS-RPT reports on TLS negotiation for mail arriving AT this domain, so it is
+  // inbound-only for the same reason MTA-STS is. (DANE needs no entry: checkTransport
+  // returns early on a null MX, so it is never probed.)
+  const inboundOnly = new Set(["MTA-STS", "TLS-RPT"]);
+  const mtaApplicable = noInboundMail
+    ? [{ area: "MTA-STS", severity: "pass", title: "MTA-STS not applicable — domain receives no mail",
+        detail: "MTA-STS tells sending servers to require TLS when delivering TO this domain. This domain publishes no inbound mail servers (a null MX, or none at all), so there is no inbound delivery for a policy to protect. Not a gap.", fix: null }]
+    : mta;
+  const F = [...spf, ...dkim, ...dmarc, ...mtaApplicable, ...simple, ...transport, ...mxh, ...dnssec, ...rep, ...aibots, ...rdns, ...caa]
+    .filter((f) => !(noInboundMail && inboundOnly.has(f.area) && f.severity !== "pass"));
   F.sort((x, y) => (SEV_ORDER[x.severity] ?? 5) - (SEV_ORDER[y.severity] ?? 5));
   for (const f of F) {
     const [effort, value] = priority(f);
@@ -902,7 +1079,22 @@ export async function auditDomain(domain, q) {
   }
   const summary = {};
   for (const s of ["critical", "high", "medium", "low", "pass"]) summary[s] = F.filter((f) => f.severity === s).length;
-  return { domain, primary_mx: mxHost, summary, findings: F };
+  // I20: if a CRITICAL lookup (SPF/DMARC/MX) hit a transient failure (SERVFAIL/REFUSED or
+  // a fetch error) the audit is inconclusive — those verdicts can't be trusted as "absent".
+  // Distinct from NXDOMAIN(3)/NODATA(0), which are conclusive. The Action folds this into
+  // audit-complete; other surfaces expose it for downstream consumers.
+  let inconclusive = false, inconclusiveReason = null;
+  if (typeof q === "function" && q.meta) {
+    for (const [n, t] of [[domain, "TXT"], ["_dmarc." + domain, "TXT"], [domain, "MX"]]) {
+      const m = await q.meta(n, t);
+      if (m.error || m.status === 2 || m.status === 5) {
+        inconclusive = true;
+        inconclusiveReason = t + " " + n + ": " + (m.error ? "lookup error" : "SERVFAIL/REFUSED");
+        break;
+      }
+    }
+  }
+  return { domain, primary_mx: mxHost, summary, findings: F, inconclusive, inconclusive_reason: inconclusiveReason };
 }
 
 // batch_score.py parity surface — the DNS-only, edge-safe Y/N buckets + gap.
@@ -1068,9 +1260,21 @@ function renderMatrix(domain, findings) {
     const gaps = findings.filter((f) => f.severity !== "pass");
     const byQuad = { "low,high": [], "high,high": [], "low,low": [], "high,low": [] };
     for (const f of gaps) byQuad[f.effort + "," + f.value].push(f);
-    // Empty high-value quadrants read as strong, not blank (locked treatment).
-    win = byQuad["low,high"].map(liGap).join("") || '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> All solid — SPF, DKIM &amp; DMARC enforced</li>';
-    maj = byQuad["high,high"].map(liGap).join("") || '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> Nothing major — posture is sound</li>';
+    // An empty quadrant means "nothing landed in THIS quadrant" — it does NOT license a
+    // claim about the whole domain. Until 2026-07-30 the fallbacks here asserted
+    // "All solid — SPF, DKIM & DMARC enforced" and "posture is sound" whenever their
+    // quadrant happened to be empty, regardless of what sat in the other three. On
+    // gmail.com (p=none, and its one discoverable selector carrying a revoked empty p=)
+    // that produced a report claiming DMARC was enforced directly above its own
+    // recommendations to ramp DMARC to p=reject and to confirm DKIM signing. One
+    // contradiction on the summary line discredits every finding under it.
+    // So: quadrant placeholders describe the quadrant, and the all-clear is stated ONLY
+    // when there are genuinely no gaps anywhere.
+    const clean = gaps.length === 0;
+    const allClear = '<li class="ap-ok"><i class="ti ti-check" aria-hidden="true"></i> No gaps found in any checked area</li>';
+    const emptyQuad = (label) => '<li class="ap-ph">' + label + '</li>';
+    win = byQuad["low,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing quick and high-impact — see the other quadrants"));
+    maj = byQuad["high,high"].map(liGap).join("") || (clean ? allClear : emptyQuad("Nothing big and high-impact"));
     fill = byQuad["low,low"].map(liGap).join("");
     hard = byQuad["high,low"].map(liGap).join("");
     sub = 'for <code>' + esc(domain) + '</code> — ranked by effort &times; value';
@@ -1101,27 +1305,27 @@ const FAQ = [
   ["What's the difference between SPF, DKIM, and DMARC?",
     "They are three layers of proving an email is really from you. SPF lists which servers may send for your domain. DKIM cryptographically signs each message against a public key in your DNS. DMARC ties SPF and DKIM together with alignment (the authenticated domain must match the visible From: address) and tells receivers what to do when checks fail. You need all three — SPF and DKIM without an enforcing DMARC policy still leaves you spoofable."],
   ["What is the difference between p=none, p=quarantine, and p=reject?",
-    "DMARC's p= policy tells receivers how to handle mail that fails authentication. p=none is monitor-only — failing mail still gets delivered and anyone can still spoof you. p=quarantine sends failing mail to spam. p=reject rejects it outright, which is the goal and what large mailbox providers increasingly expect from bulk senders. The path is none to quarantine to reject, ramping as you confirm your legitimate mail passes. Staying on p=none forever is the most common deliverability mistake."],
+    "DMARC's p= policy tells receivers how to handle mail that fails authentication. p=none is monitor-only — the domain owner offers no expression of preference. p=quarantine asks receivers to treat failures as suspicious. p=reject requests rejection of DMARC-failing mail, although receivers can still apply local policy. Which policy is appropriate depends on your mail flows. RFC 9989 §7.4 says domains with users who may post to mailing lists should not publish p=reject, and any domain using p=reject must apply valid DKIM rather than relying only on SPF. Dedicated transactional domains may face fewer indirect-mail risks, but should still verify their actual flows. For affected user-mail domains considering reject, the RFC recommends at least a month at p=none and an equally long period at p=quarantine before proceeding. As of August 2026, Google's bulk-sender guidance permits p=none. Enforcement is primarily an anti-spoofing choice, not a universal deliverability requirement."],
   ["How do I know if my domain is ready to send cold or scaled outbound?",
     "Valid SPF/DKIM/DMARC records are necessary but not sufficient. Watch three traps: receive-only domains (auth records do not make a forwarding-only domain send-ready), alignment (your ESP's mail must align to your domain, not the ESP's), and never sending cold or scaled outbound from your root domain — use a dedicated sending subdomain so a reputation hit on cold outreach does not poison your primary mail."],
   ["Do I need MTA-STS, TLS-RPT, and DANE?",
-    "These are transport-security records that ensure mail to your domain travels over encrypted, authenticated connections. MTA-STS declares 'always use TLS to reach me'; TLS-RPT reports when someone fails to connect securely; DANE pins your TLS certificate in DNS (requires DNSSEC). They are not a deliverability lever the way DMARC is, but they are increasingly required in regulated, government, and security-conscious contexts. Treat them as hardening — do them when the requirement or buyer calls for it."],
+    "These are transport-security records that ensure mail to your domain travels over encrypted, authenticated connections. MTA-STS declares 'always use TLS to reach me'; TLS-RPT reports when someone fails to connect securely; DANE pins your TLS certificate in DNS (and is only trusted when your DNSSEC chain validates). They are not a deliverability lever the way DMARC is, but they are increasingly required in regulated, government, and security-conscious contexts. Treat them as hardening — do them when the requirement or buyer calls for it."],
   ["What is BIMI and is it worth it?",
     "BIMI shows your verified logo next to your emails in supporting inboxes (Gmail, Apple Mail, Yahoo). It requires a strong DMARC policy (quarantine or reject) as a prerequisite, and a VMC (Verified Mark Certificate) for the blue verified checkmark. It is worth it for brands sending real volume: it lifts recognition and open rates, and the DMARC prerequisite forces a strong authentication posture. High value — not just hardening."],
   ["What are the Gmail and Yahoo sender requirements?",
-    "Since 2024, Gmail and Yahoo require bulk senders (roughly 5,000+ messages/day to their users) to authenticate with SPF and DKIM, publish a DMARC policy with alignment, keep spam-complaint rates under about 0.3%, and support one-click unsubscribe. Microsoft has announced similar expectations. Mail that does not comply gets throttled or junked."],
+    "Since 2024, Gmail and Yahoo require bulk senders (roughly 5,000+ messages/day to their users) to authenticate with SPF and DKIM, publish a DMARC policy with alignment (Google explicitly allows that policy to be p=none — authentication is the requirement, enforcement is your choice), and keep spam-complaint rates under about 0.3%. One-click unsubscribe is required for marketing and subscribed messages specifically, not for transactional mail like receipts and alerts. Microsoft has announced similar expectations. Mail that does not comply gets throttled or junked."],
   ["What is DMARCbis?",
-    "DMARCbis is the modernized DMARC standard, published as RFC 9989 (May 2026), which obsoletes the original DMARC (RFC 7489). The changes that matter to operators: a DNS Tree Walk replaces the Public Suffix List for determining organizational domains; np= is a new policy for non-existent subdomains (set np=reject to shut down cousin-domain spoofing); and pct, rf, and ri are removed. If you run DMARC across subdomains, this is worth acting on now."],
+    "DMARCbis is the modernized DMARC standard, published as RFC 9989 (May 2026), which obsoletes the original DMARC (RFC 7489). The changes that matter to operators: a DNS Tree Walk replaces the Public Suffix List for determining organizational domains; np= is a new policy that applies specifically to NON-EXISTENT subdomains of your domain (set np=reject so nobody can send as a subdomain you never created). Note what it does not do: a lookalike \"cousin\" domain is a separate registration, and no DMARC policy on your domain can reach it; and pct, rf, and ri are removed. If you run DMARC across subdomains, this is worth acting on now."],
   ["Does email need to be post-quantum ready?",
-    "Eventually yes, and the clock is public. NIST guidance (IR 8547) sets today's classical crypto (RSA-2048, ECC P-256) as deprecated by 2030 and disallowed by 2035. For email this shows up in transport (TLS 1.3 is the floor for hybrid post-quantum key exchange), DKIM signing (the migration path is to larger PQC signatures — a domain on RSA-1024 DKIM is doubly behind), and DNSSEC. The cheap moves now — get to TLS 1.3, rotate off RSA-1024 DKIM — are also your PQC head start."],
+    "Eventually yes, and the clock is public. NIST's draft guidance on the transition (IR 8547, still an initial public draft rather than final) proposes treating today's classical crypto (RSA-2048, ECC P-256) as deprecated around 2030 and disallowed after 2035 — a direction of travel, not a settled mandate. For email this shows up in transport (TLS 1.3 is the floor for hybrid post-quantum key exchange), DKIM signing (where there is as yet NO standardized post-quantum path — the PQC signature schemes are large and the IETF work is early — so the actionable move today is classical hygiene: a domain still on RSA-1024 DKIM is behind on the standard that already exists), and DNSSEC. The cheap moves now — get to TLS 1.3, rotate off RSA-1024 DKIM — are also your PQC head start."],
   ["Do I need DNSSEC, and does it affect email?",
-    "DNSSEC cryptographically signs your DNS so the answers — including your mail records — can't be forged in transit, and it's the prerequisite for DANE. It's more a security/trust measure than a direct deliverability lever: enable it when a security review or compliance requirement calls for it, or as part of a strong overall posture. The audit flags whether your zone is signed."],
+    "DNSSEC cryptographically signs your DNS so the answers — including your mail records — can't be forged in transit, and it's the prerequisite for DANE. It's more a security/trust measure than a direct deliverability lever: enable it when a security review or compliance requirement calls for it, or as part of a strong overall posture. The audit flags whether your zone is signed (and its answers cryptographically validate)."],
   ["Does my domain's age affect deliverability?",
     "Yes. A brand-new domain has no sending reputation, so mailbox providers throttle it by default — send cold or at volume from a freshly registered domain and much of it lands in spam. Warm up gradually: start with low volume to engaged recipients and ramp over a few weeks before scaling. The audit flags a domain that's only days old."],
   ["Can AI search engines like ChatGPT and Perplexity see my site?",
     "Increasingly people ask AI answer engines about vendors instead of searching, and those engines use their own crawlers (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot, Google-Extended and others). If your robots.txt blocks them, your site is invisible to those answers. The audit checks whether your robots.txt is shutting AI crawlers out, so you can decide which to allow."],
   ["Is the audit really read-only? Does it change anything?",
-    "Yes, fully read-only. It inspects public DNS and drafts the exact changes for you to review, but it never touches your DNS, sends mail, or needs credentials. Nothing changes until you choose to apply a fix yourself."],
+    "Yes, fully read-only — though \"read\" covers a little more than DNS, so here is the whole list. It queries your public DNS records; it fetches your published MTA-STS policy over HTTPS (that file is served over HTTPS by design, not DNS); it reads your robots.txt to check AI-crawler visibility; and it looks up your domain's registration date via public RDAP. All four are public information that any mail server or crawler can read. It drafts the exact changes for you to review, but it never touches your DNS, sends mail, or needs credentials. Nothing changes until you choose to apply a fix yourself."],
 ];
 
 function faqJsonLd() {
@@ -1355,7 +1559,7 @@ async function rateLimited(env, ip) {
 
 // Pages _headers only covers STATIC assets — Function responses get no headers
 // from it, so set the security headers here too (parity with the static site).
-const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com cdn.jsdelivr.net; font-src fonts.gstatic.com cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
+const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' fonts.googleapis.com cdn.jsdelivr.net; font-src fonts.gstatic.com cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
 
 function htmlResponse(body, status, cache) {
   return new Response(body, {

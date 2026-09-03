@@ -11,6 +11,7 @@ import {
   normalizeFailOn,
   worstSeverity,
   decide,
+  finalize,
   mdCell,
   code,
   renderSummary,
@@ -131,9 +132,53 @@ console.log("== error-domain handling in summary ==");
 {
   const errResult = { domain: "broken.invalid", primary_mx: null, error: "no such host", summary: { critical: 0, high: 0, medium: 0, low: 0, pass: 0 }, findings: [] };
   const decision = decide([errResult], "high");
-  const md = renderSummary([errResult], decision);
-  check("error domain doesn't fail the build by itself", decision.passed === true);
+  const md = renderSummary([errResult], finalize([errResult], "high"));
+  // decide() is findings-only: an error domain has no findings, so it doesn't cross a threshold.
+  check("decide() (findings-only) passes an error domain", decision.passed === true);
   check("error domain shown in summary", md.includes("Audit failed: no such host"));
+}
+
+console.log("== I19/I20: inconclusive audit + strict input (finalize) ==");
+{
+  const err = { domain: "broken.invalid", error: "SERVFAIL", summary: { critical: 0, high: 0, medium: 0, low: 0, pass: 0 }, findings: [] };
+  const clean = mkResult("ok.com", ["pass"]);
+  // Lenient default: inconclusive → passed=false + audit-complete=false, but build NOT failed.
+  const lenient = finalize([err, clean], "high", true);
+  check("I20 inconclusive → passed=false", lenient.passed === false);
+  check("I20 inconclusive → audit-complete=false", lenient.auditComplete === false);
+  check("I20 lenient default → build not failed", lenient.failBuild === false);
+  // Opt-in strict: inconclusive fails the build.
+  const strict = finalize([err, clean], "high", false);
+  check("I20 continue-on-audit-error=false → build fails", strict.failBuild === true);
+  // A fully-clean, complete audit passes and doesn't fail.
+  const ok = finalize([clean], "high", true);
+  check("complete clean audit → passed + audit-complete", ok.passed === true && ok.auditComplete === true && ok.failBuild === false);
+  // A real threshold-crossing finding still fails regardless of completeness.
+  const bad = finalize([mkResult("x.com", ["high"])], "high", true);
+  check("threshold-crossing finding → build fails", bad.failBuild === true && bad.passed === false);
+  // I19 strict input: no valid domains parse to an empty list (run() exits non-zero on this).
+  check("I19 empty input → no domains", parseDomains("").length === 0 && parseDomains(" , ;; @@ ").length === 0);
+}
+
+console.log("== I20-resolver: transient DNS on a critical lookup → inconclusive ==");
+{
+  // Mock resolver: no records, meta reports the given rcode for _dmarc's TXT lookup.
+  const metaQ = (statusForDmarc) => {
+    const q = async () => [];
+    q.meta = async (name, type) =>
+      (name === "_dmarc.x.com" && type === "TXT")
+        ? { status: statusForDmarc, ad: false, error: false }
+        : { status: 0, ad: false, error: false };
+    return q;
+  };
+  const servfail = await auditDomain("x.com", metaQ(2)); // 2 = SERVFAIL
+  check("I20 SERVFAIL on a critical lookup → inconclusive", servfail.inconclusive === true);
+  const nxdomain = await auditDomain("x.com", metaQ(3)); // 3 = NXDOMAIN is conclusive
+  check("I20 NXDOMAIN is conclusive → not inconclusive", nxdomain.inconclusive === false);
+  const dec = finalize([servfail], "advisory", true);
+  check("I20 inconclusive audit → audit-complete=false", dec.auditComplete === false && dec.passed === false);
+  check("I20 inconclusive lenient default → build not failed", dec.failBuild === false);
+  check("I20 inconclusive + continue-on-audit-error=false → build fails", finalize([servfail], "advisory", false).failBuild === true);
 }
 
 console.log("== summaryOutput JSON ==");
@@ -157,6 +202,40 @@ try {
   check("renders a non-empty summary for the live result", md.length > 200);
 } catch (e) {
   check(`live smoke test threw: ${e.message}`, false);
+}
+
+// ── remediation disclosure ───────────────────────────────────────────────────
+// The table cell renders f.action, a short LABEL. f.fix used to be dropped entirely,
+// so the conditions on a fix never reached anyone running this in CI. Assert the
+// disclosure both ways: it must appear when a fix exists, and must NOT appear when
+// none does (an empty <details> is worse than no <details>).
+{
+  const withFix = {
+    domain: "d1.example", summary: { high: 1 },
+    findings: [{ area: "DMARC", severity: "high", title: "DMARC policy is p=none (monitor only)",
+      action: "Review DMARC reports, then stage quarantine",
+      fix: "Before considering p=reject, ensure every legitimate stream has valid, DMARC-aligned DKIM rather than relying only on SPF." }],
+  };
+  const md = renderSummary([withFix], decide([withFix], "advisory"));
+  check("the short label still renders in the table", md.includes("Review DMARC reports, then stage quarantine"));
+  check("the fix renders in a disclosure", /<details><summary>/.test(md) && md.includes("</details>"));
+  check("the fix TEXT actually reaches the reader", md.includes("DMARC-aligned DKIM rather than relying only on SPF"));
+
+  const noFix = {
+    domain: "d2.example", summary: { low: 1 },
+    findings: [{ area: "MX", severity: "low", title: "something", action: "Do a thing", fix: null }],
+  };
+  const md2 = renderSummary([noFix], decide([noFix], "advisory"));
+  check("no empty disclosure when nothing carries a fix", !md2.includes("<details>"));
+
+  const nasty = {
+    domain: "d3.example", summary: { high: 1 },
+    findings: [{ area: "DMARC", severity: "high", title: "t", action: "a",
+      fix: "</details><script>alert(1)</script>|evil|" }],
+  };
+  const md3 = renderSummary([nasty], decide([nasty], "advisory"));
+  check("a hostile fix string cannot close the disclosure or inject a table row",
+    !md3.includes("</details><script>") && !/\|evil\|/.test(md3));
 }
 
 console.log("");
