@@ -2,7 +2,10 @@
 // Runs auditDomain() against canned DNS (mock resolver, no network) and asserts the
 // v1.2 batch-1 false-pass fixtures now produce the correct verdict. Exits non-zero on
 // any violation so it runs as a CI gate.
-import { auditDomain, mtaStsPolicyProblems } from "../src/engine.mjs";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { auditDomain, buckets, mtaStsPolicyProblems } from "../vendor/amino-audit-engine/engine.mjs";
+import { mdCell, renderSummary } from "../src/index.mjs";
 
 function makeQ(dns, dkimRec) {
   return async (name, type) => {
@@ -15,6 +18,47 @@ function makeQ(dns, dkimRec) {
 const titles = (F) => F.map((f) => f.area + ": " + f.title);
 let ok = true;
 const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "FAIL"), name); };
+
+function fixtureQ(dns, http = {}, nowMs = 1767225600000, dnssecProbe = {}) {
+  const norm = (name) => name.replace(/\.+$/, "").toLowerCase();
+  const map = {};
+  for (const [name, records] of Object.entries(dns || {})) map[norm(name)] = records;
+  const q = async (name, type) => {
+    name = norm(name);
+    if (map[name] && map[name][type]) return map[name][type];
+    for (const key of Object.keys(map)) {
+      if (key.startsWith("*._domainkey.") && name.endsWith(key.slice(1)) && map[key][type]) {
+        return map[key][type];
+      }
+    }
+    return [];
+  };
+  q.meta = async (name, rrtype) => {
+    const entry = map[norm(name)] || {};
+    const configured = entry.status !== undefined ? entry.status : 0;
+    const status = configured && typeof configured === "object" && !Array.isArray(configured)
+      ? (configured[String(rrtype || "").toUpperCase()] ?? 0)
+      : configured;
+    return { status, ad: !!entry.ad, error: false };
+  };
+  const dnssecProbeMap = {};
+  for (const [name, evidence] of Object.entries(dnssecProbe || {})) {
+    dnssecProbeMap[norm(name)] = evidence;
+  }
+  q.dnssecProbe = async (name) => structuredClone(dnssecProbeMap[norm(name)] || {});
+  const response = (name) => http[name] === "unavailable" || http[name] === undefined
+    ? null : structuredClone(http[name]);
+  q.http = {
+    mtaSts: async () => response("mta_sts_policy"),
+    robots: async () => response("robots"),
+    rdap: async () => {
+      const value = response("rdap");
+      return value === null ? null : { status: value.status, data: value.data };
+    },
+  };
+  q.clock = { nowMs: () => nowMs };
+  return q;
+}
 
 { // I1 — revoked DKIM (empty p=) must not read as present
   const F = (await auditDomain("ex.com", makeQ({ "ex.com": {} }, "v=DKIM1; k=rsa; p="))).findings;
@@ -59,30 +103,32 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   assert("I16 unfetchable policy → flagged", t.some((x) => x.includes("policy file not retrievable")));
   assert("I16 not reported present/enforced", !t.some((x) => x.includes("MTA-STS present")));
 }
+{ // WHI-50 — only a true null MX exempts inbound-only controls
+  const nullMxDns = {
+    "nomail.invalid": { TXT: ["v=spf1 -all"], MX: ["0 ."] },
+    "_dmarc.nomail.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const nullFindings = (await auditDomain("nomail.invalid", makeQ(nullMxDns))).findings;
+  const nullScore = await buckets("nomail.invalid", makeQ(nullMxDns));
+  assert("WHI-50 null MX → MTA-STS not applicable", nullFindings.some((f) => f.title === "MTA-STS not applicable — domain receives no mail"));
+  assert("WHI-50 null MX → no TLS-RPT or DANE gap", !nullFindings.some((f) => ["TLS-RPT"].includes(f.area) || /DANE/.test(f.title)));
+  assert("WHI-50 null MX → inbound score buckets are N/A and gap is 2", nullScore.MTA_STS === null && nullScore.TLS_RPT === null && nullScore.DANE === null && nullScore.gap === 2);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 2026-07-30 — claim assertions. This engine is PUBLIC (GitHub Marketplace), and five
-// false claims sat here identically to the web tool and the public skill. The inventory
-// parity gate compares which CHECKS exist, not what they SAY, so wording was wrong in
-// lockstep and nothing caught it. These assert the text of this copy specifically.
-// ═══════════════════════════════════════════════════════════════════════════════
-{
-  const { readFileSync } = await import("node:fs");
-  const SRC = readFileSync(new URL("../src/engine.mjs", import.meta.url), "utf8");
-  assert("no empty-quadrant global all-clear", !/DKIM &amp; DMARC enforced<\/li>/.test(SRC));
-  assert("all-clear gated on zero gaps", /const clean = gaps\.length === 0/.test(SRC));
-  assert("np= not claimed to stop cousin-domain spoofing", !/np=reject to shut down cousin-domain spoofing/.test(SRC));
-  assert("np= scope stated correctly", /NON-EXISTENT subdomains of your domain/.test(SRC));
-  assert("IR 8547 draft status stated", /still an initial public draft/.test(SRC) && !/IR 8547\) sets today's classical crypto/.test(SRC));
-  assert("no PQC migration path claimed for DKIM", /NO standardized post-quantum path/.test(SRC));
-  assert("read-only answer names the HTTPS fetches", /fetches your published MTA-STS policy over HTTPS/.test(SRC));
-  assert("Gmail p=none allowance stated", /Google explicitly allows that policy to be p=none/.test(SRC));
-  assert("one-click unsubscribe scope stated", /marketing and subscribed messages specifically/.test(SRC));
-  assert("pct= not recommended for staging", !/optionally with pct= staging/.test(SRC));
-  assert("the pct removal is stated", /RFC 9989 removed pct/.test(SRC));
-  assert("MTA-STS rollout staged via testing", /start at mode: testing/.test(SRC));
-  assert("MTA-STS cites BSI, not NIS2", !/growing compliance ask under NIS2/.test(SRC));
-  assert("inbound controls gated on receiving mail", /noInboundMail/.test(SRC));
+  const noMxDns = {
+    "nomx.invalid": { TXT: ["v=spf1 -all"] },
+    "_dmarc.nomx.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const noMxFindings = (await auditDomain("nomx.invalid", makeQ(noMxDns))).findings;
+  const noMxScore = await buckets("nomx.invalid", makeQ(noMxDns));
+  assert("WHI-50 no MX → inbound controls still apply", noMxFindings.some((f) => f.title === "No MTA-STS policy") && noMxFindings.some((f) => f.title === "No TLS-RPT") && noMxScore.MTA_STS === false && noMxScore.gap === 5);
+
+  const ambiguousDns = {
+    "ambiguous.invalid": { TXT: ["v=spf1 -all"], MX: ["0 .", "10 mx.ambiguous.invalid."] },
+    "_dmarc.ambiguous.invalid": { TXT: ["v=DMARC1; p=reject"] },
+  };
+  const ambiguousFindings = (await auditDomain("ambiguous.invalid", makeQ(ambiguousDns))).findings;
+  const ambiguousScore = await buckets("ambiguous.invalid", makeQ(ambiguousDns));
+  assert("WHI-50 ambiguous MX → fails toward reporting", ambiguousFindings.some((f) => f.title === "No MTA-STS policy") && ambiguousFindings.some((f) => f.title === "No DANE/TLSA") && ambiguousScore.MTA_STS === false && ambiguousScore.gap === 5);
 }
 
 // Summary LAST — it previously sat mid-file with a hard process.exit(), so anything
@@ -100,17 +146,62 @@ const assert = (name, cond) => { ok = cond && ok; console.log((cond ? "PASS" : "
   // §7.4 scopes BOTH its "SHOULD NOT publish p=reject" and its month-then-month
   // staging advice to domains hosting users who might post to mailing lists.
   // Neither may be restated here as universal advice.
-  const { readFileSync: rfs } = await import("node:fs");
-  const SRC2 = rfs(new URL("../src/engine.mjs", import.meta.url), "utf8");
-  assert("§7.4 reject is not framed as the destination", !/ramp to p=quarantine/.test(SRC2));
-  assert("§7.4 no unevidenced provider trust-signal claim", !/increasingly treat enforced policies as a trust signal/.test(SRC2));
-  assert("§7.4 no claim that p=reject is 'the goal'", !/which is the goal and what large mailbox providers/.test(SRC2));
-  assert("§7.4 p=none is not called the most common deliverability mistake", !/most common deliverability mistake/.test(SRC2));
-  assert("§7.4 mailing-list caution is stated and scoped", /users may post to mailing lists not to publish p=reject/.test(SRC2));
-  assert("§7.4 staging advice is scoped, not universal", /for those that still do, it recommends at least a month/.test(SRC2));
-  assert("§7.4 DKIM-not-SPF-alone prerequisite is stated", /DMARC-aligned DKIM rather than relying only on SPF/.test(SRC2));
-  assert("t=y is offered in place of the removed pct", /use t=y to test an enforcement policy/.test(SRC2));
-  assert("the Google allowance is dated", /As of August 2026, Google's bulk-sender guidance permits p=none/.test(SRC2));
+}
+
+{ // WHI-280 — Action rendering consumes, but never derives, engine-owned markers.
+  const skillsDir = process.env.SKILLS_DIR;
+  assert("WHI-280 pinned skills checkout is provided to the display contract", !!skillsDir);
+  if (skillsDir) {
+    const fixturePath = resolve(skillsDir, "conformance/fixtures.json");
+    const { fixtures } = JSON.parse(readFileSync(fixturePath, "utf8"));
+    const cases = fixtures.filter((fixture) => fixture.id.startsWith("inconclusive-") && fixture.expect?.inconclusive === true);
+    assert("WHI-280 display contract selects exactly 8 inconclusive fixtures", cases.length === 8);
+    for (const fixture of cases) {
+      const q = fixtureQ(
+        fixture.input.dns,
+        fixture.input.http,
+        fixture.input.nowMs,
+        fixture.input.dnssecProbe,
+      );
+      const result = await auditDomain(fixture.input.domain, q);
+      const summary = renderSummary([result], {
+        passed: false,
+        failBuild: false,
+        auditComplete: false,
+        level: "advisory",
+        reason: "fixture display contract",
+      });
+      const caution = `> We couldn't finish checking this domain. A DNS lookup failed (\`${fixture.expect.inconclusive_reason}\`), so anything reported below as missing may be wrong, especially findings marked Not confirmed. Re-run before acting on it.`;
+      assert(`${fixture.id} renders one exact inconclusive caution line`, summary.split(caution).length - 1 === 1);
+
+      const expected = fixture.expect.findings.filter((finding) => {
+        const surfaces = finding.surfaces || ["skill", "web", "action"];
+        return surfaces.includes("action") && finding.severity !== "pass";
+      });
+      for (const wanted of expected) {
+        const actual = result.findings.find((finding) => finding.area === wanted.area && finding.title === wanted.title);
+        assert(`${fixture.id} ${wanted.area}|${wanted.title} exists for Action display`, !!actual);
+        if (!actual) continue;
+        if (wanted.unconfirmed) {
+          const issue = `${actual.title} (Not confirmed: ${wanted.unconfirmed})`;
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} row uses finding.unconfirmed`,
+            summary.includes(`| ${mdCell(actual.area)} | ${mdCell(issue)} |`),
+          );
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} fix starts with the re-run lead-in`,
+            !actual.fix || summary.includes(`- **${mdCell(actual.title)}** — ${mdCell(`Re-run the check first. If it's still reported: ${actual.fix}`)}`),
+          );
+        } else {
+          assert(
+            `${fixture.id} ${wanted.area}|${wanted.title} unmarked row stays unmarked`,
+            summary.includes(`| ${mdCell(actual.area)} | ${mdCell(actual.title)} |`)
+              && !summary.includes(`${mdCell(actual.title)} \\(Not confirmed:`),
+          );
+        }
+      }
+    }
+  }
 }
 
 console.log(ok ? "\nALL PASS" : "\nSOME FAILED");

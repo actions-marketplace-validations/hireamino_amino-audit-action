@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Run gitleaks (checksum-verified)
         env:
@@ -36,6 +37,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
@@ -45,8 +49,25 @@ jobs:
       - name: Run local test harness
         run: node test/local.mjs
 
+      - name: Clone amino-skills at the pinned revision (public, token-free)
+        run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
+
       - name: Run conformance checks (correctness spec)
+        env:
+          SKILLS_DIR: /tmp/amino-skills
         run: node test/conformance.mjs
+
+      - name: Verify shipped engine provenance and Action wiring
+        run: node test/engine-source-contract.mjs
+
+      - name: Prove DNS metadata and DNSSEC probe reach the shipped engine
+        run: node test/engine-adapter-seam.mjs
+
+      - name: Canary shipped-artifact and request-scoped wiring gates
+        run: node test/action-migration-canary.mjs
+
+      - name: Verify every remote workflow action is SHA-pinned
+        run: node test/workflow-action-pins.mjs
 
       # The pin script is what decides which remote code runs on this runner, so it is
       # canaried here rather than trusted from a laptop: every guard must reject the case
@@ -55,10 +76,49 @@ jobs:
       - name: Canary the pinned-fetch guards
         run: bash scripts/canary-fetch-pinned-skills.sh
 
-      - name: Clone amino-skills at the pinned revision (public, token-free)
-        run: scripts/fetch-pinned-skills.sh /tmp/amino-skills
+      - name: Canary the canonical-engine pinned-fetch guards
+        run: bash scripts/canary-fetch-pinned-engine.sh
+
+      - name: Fetch canonical engine and prove shipped byte identity
+        run: bash scripts/verify-pinned-engine.sh /tmp/amino-audit-engine
+
+      - name: Run pinned canonical engine contract suite
+        working-directory: /tmp/amino-audit-engine
+        run: bash scripts/verify.sh
+
+      - name: Canary pinned canonical engine contract suite
+        env:
+          ENGINE_CHECKOUT: /tmp/amino-audit-engine
+        run: node test/engine-suite-canary.mjs
 
       - name: Fixtures-driven conformance runner (shared corpus — hard gate)
         env:
-          ENGINE: ${{ github.workspace }}/src/engine.mjs
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+          SURFACE: action
         run: node /tmp/amino-skills/conformance/run.mjs
+
+      - name: Mutation canaries (material contract — hard gate)
+        env:
+          ENGINE: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+          SURFACE: action
+        run: node /tmp/amino-skills/conformance/canary.mjs
+
+      - name: Findings inventory (12 areas, 41 action labels)
+        env:
+          PARITY_PY: /tmp/amino-skills/amino-deliverability-audit/skills/amino-deliverability-audit/scripts/audit.py
+          PARITY_JS: ${{ github.workspace }}/vendor/amino-audit-engine/engine.mjs
+        run: node /tmp/amino-skills/web-parity/inventory.mjs
+
+      - name: Export immutable pre-migration Action host
+        run: |
+          git show ae04a363f76da800ac6d98a3647cf5bf5ab7e44a:src/index.mjs > /tmp/action-index-ae04a36.mjs
+          git show ae04a363f76da800ac6d98a3647cf5bf5ab7e44a:action.yml > /tmp/action-ae04a36.yml
+
+      - name: Action inputs, outputs, rendering and exit behavior are unchanged
+        env:
+          BASELINE_INDEX: /tmp/action-index-ae04a36.mjs
+          BASELINE_ACTION: /tmp/action-ae04a36.yml
+        run: node test/host-surface-equivalence.mjs
+
+      - name: Execute Action entrypoint from a clean clone
+        run: bash scripts/run-clean-clone-action.sh "$(git rev-parse HEAD)"

@@ -8,7 +8,7 @@
 // All logic that doesn't touch the network is exported so test/local.mjs can
 // unit-test it with a stub resolver / synthetic findings.
 
-import { auditDomain } from "./engine.mjs";
+import { createAuditEngine, createDefaultAdapters } from "../vendor/amino-audit-engine/engine.mjs";
 
 // ── Severity model ────────────────────────────────────────────────────────────
 // Worst-first ordering. `pass` is not a failable severity.
@@ -35,7 +35,8 @@ export function parseDomains(raw, cap = MAX_DOMAINS) {
   return out;
 }
 
-// Loose syntactic gate (the engine re-validates strictly via its own DOMAIN_RE).
+// Loose syntactic gate for Action input hygiene; the canonical engine expects a
+// validated domain and does not independently apply this DOMAIN_RE.
 // Must have a dot, only DNS-legal chars, <=253 chars, labels 1..63, no leading '-'.
 export function looksLikeDomain(d) {
   if (!d || d.length > 253 || !d.includes(".")) return false;
@@ -173,6 +174,10 @@ export function renderSummary(results, decision) {
   for (const r of results) {
     const { counts, verdict } = verdictLine(r);
     lines.push(`### \`${code(r.domain)}\` — ${verdict}`);
+    if (r.inconclusive && r.inconclusive_reason) {
+      lines.push("");
+      lines.push(`> We couldn't finish checking this domain. A DNS lookup failed (\`${code(r.inconclusive_reason)}\`), so anything reported below as missing may be wrong, especially findings marked Not confirmed. Re-run before acting on it.`);
+    }
     if (r.error) {
       lines.push("");
       lines.push(`> Audit failed: ${mdCell(r.error)}`);
@@ -192,7 +197,8 @@ export function renderSummary(results, decision) {
     lines.push("| --- | --- | --- | --- |");
     for (const f of gaps) {
       const sev = `${SEV_EMOJI[f.severity] || ""} ${mdCell(f.severity)}`.trim();
-      lines.push(`| ${sev} | ${mdCell(f.area)} | ${mdCell(f.title)} | ${mdCell(f.action || f.fix || "")} |`);
+      const issue = f.unconfirmed ? `${f.title} (Not confirmed: ${f.unconfirmed})` : f.title;
+      lines.push(`| ${sev} | ${mdCell(f.area)} | ${mdCell(issue)} | ${mdCell(f.action || f.fix || "")} |`);
     }
     lines.push("");
     // The table cell carries f.action, which is a short verb-led LABEL — deliberately so,
@@ -205,7 +211,10 @@ export function renderSummary(results, decision) {
     if (fixes.length) {
       lines.push("<details><summary>What to do about each of these</summary>");
       lines.push("");
-      for (const f of fixes) lines.push(`- **${mdCell(f.title)}** — ${mdCell(f.fix)}`);
+      for (const f of fixes) {
+        const fix = f.unconfirmed ? `Re-run the check first. If it's still reported: ${f.fix}` : f.fix;
+        lines.push(`- **${mdCell(f.title)}** — ${mdCell(fix)}`);
+      }
       lines.push("");
       lines.push("</details>");
       lines.push("");
@@ -344,7 +353,9 @@ export async function run() {
   const results = [];
   for (const domain of domains) {
     try {
-      const r = await auditDomain(domain);
+      // The default adapters cache DNS for their lifetime with no TTL. Constructing
+      // both inside the audit call prevents stale state crossing domains or runs.
+      const r = await createAuditEngine(createDefaultAdapters()).auditDomain(domain);
       results.push(r);
     } catch (e) {
       // One bad domain must not abort the run — record it as an inconclusive audit
